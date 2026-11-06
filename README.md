@@ -4,7 +4,26 @@ Post-contenido de la Unidad 11 de Patrones de Diseño de Software. Proyecto Spri
 (Java 17) con un servicio de inventario que nace con dos code smells reales. Primero se
 blinda con pruebas de caracterización y después se refactoriza, eligiendo la técnica de
 Fowler para cada smell y verificando con las mismas pruebas que el comportamiento
-observable no cambia.
+observable no cambia. Luego se agrega un módulo de reportes que introduce un ciclo entre
+paquetes, se diagnostica con ArchUnit y se resuelve invirtiendo la dependencia.
+
+| Resultado | Antes | Después |
+|---|---|---|
+| `actualizarInventario()` | 44 líneas, complejidad 12 | 8 líneas, complejidad 2 |
+| `switch` sobre `TipoProducto` | 2 duplicados | 0 |
+| Ciclo `inventario ↔ reportes` | ArchUnit en rojo, la app no arranca | ArchUnit en verde, la app arranca |
+| Pruebas de caracterización | 20 en verde | Las mismas 20, sin modificar, en verde |
+
+## Decisiones de diseño
+1. **Cálculo de reorden como método privado**, no clase propia: es una línea estable sin
+   variantes. [Detalle](#refactorización-1-long-method)
+2. **Enum con métodos abstractos** en lugar de una interfaz de estrategia: el conjunto de
+   tipos es cerrado y el compilador garantiza que ninguno quede sin implementar.
+   [Detalle](#refactorización-2-switch-statements-duplicados)
+3. **`NotificadorBajoStock` en `inventario`**: el dominio define la abstracción y el paquete
+   consumidor la implementa. [Detalle](#resolución-inversión-de-dependencias)
+4. **Notificación por evento** (`notificar(Producto, int)`): entrega la cantidad de reorden
+   ya calculada y en el momento en que ocurre. [Detalle](#resolución-inversión-de-dependencias)
 
 # Parte 1 — Red de seguridad y refactorización guiada por evidencia
 
@@ -227,7 +246,142 @@ Que el `@Autowired(required = false)` vuelva opcional al colaborador no evita el
 cuanto el bean existe, Spring intenta inyectarlo, y para crearlo necesita el
 `InventarioService` que todavía está en construcción.
 
+## Resolución: inversión de dependencias
+
+Se extrajo la interfaz `NotificadorBajoStock` en el paquete `inventario`.
+`InventarioService` depende solo de ella (`setNotificador(NotificadorBajoStock)`) y ya no
+importa nada de `reportes`. `ReporteBajoStockService` la implementa, de modo que la única
+dependencia entre paquetes queda en la dirección `reportes → inventario`:
+
+```java
+// inventario
+@FunctionalInterface
+public interface NotificadorBajoStock {
+    void notificar(Producto producto, int cantidadReorden);
+}
+
+// reportes
+@Service
+public class ReporteBajoStockService implements NotificadorBajoStock { ... }
+```
+
+```mermaid
+flowchart LR
+    R["reportes<br/>ReporteBajoStockService"] -- "implements NotificadorBajoStock<br/>usa Producto" --> I["inventario<br/>InventarioService · NotificadorBajoStock"]
+```
+
+```
+  inventario  (InventarioService ──usa──▶ «interface» NotificadorBajoStock)
+      ▲
+      └──────── reportes  (ReporteBajoStockService implements NotificadorBajoStock)
+```
+
+**El reporte pasó de consultar a recibir avisos.** En el código del enunciado,
+`ReporteBajoStockService` seguía recibiendo `InventarioService` por constructor. Así se
+rompe el ciclo entre paquetes, pero no el de objetos: Spring tendría que inyectar en
+`inventarioService` un notificador que a su vez necesita `inventarioService`, y la
+aplicación seguiría sin arrancar. Como ahora el reporte recibe cada alerta en `notificar()`
+(guarda nombre, stock, mínimo y cantidad a reordenar del momento), ya no necesita
+consultar al inventario. Se quitaron esa dependencia y el método
+`productosBajoStockMinimo()`, que quedaba sin uso.
+
+**Resultado de `ArquitecturaPaquetesTest` después del cambio:**
+```
+$ ./mvnw test -Dtest=ArquitecturaPaquetesTest
+[INFO] Tests run: 1, Failures: 0, Errors: 0, Skipped: 0
+[INFO] BUILD SUCCESS
+```
+
+**El comportamiento observable no cambió.** Las 20 pruebas de caracterización de la Parte 1
+se ejecutaron sin modificar una sola línea: `git diff` sobre
+`src/test/java/.../inventario/InventarioServiceTest.java`, `ClasificadorProductoTest.java` y
+`EtiquetadoProductoTest.java` está vacío desde su commit original. Además, la aplicación
+vuelve a arrancar (`Started RefactoringU11Application in 0.497 seconds`).
+
+| Momento | ArchUnit | Caracterización (20) | `spring-boot:run` |
+|---|---|---|---|
+| Tras agregar `reportes` | Falla: ciclo `inventario ↔ reportes` | Verde | No arranca: ciclo de beans |
+| Tras invertir la dependencia | Verde | Verde, sin modificar | Arranca |
+
+**Pruebas nuevas para el comportamiento nuevo.** La notificación y el reporte no existían en
+la Parte 1, así que se probaron en archivos nuevos, sin tocar los de caracterización:
+
+| Prueba | Qué verifica |
+|---|---|
+| `InventarioServiceNotificacionTest` (3) | Se notifica el producto y la cantidad de reorden correcta, y no se notifica cuando no hay bajo stock o la salida falla. Usa un lambda como doble, porque la interfaz es funcional |
+| `ReporteBajoStockServiceTest` (3) | Reporte vacío, varias alertas en orden, y que el reporte conserve el stock del momento de la alerta |
+| `InventarioReportesIntegracionTest` (1) | Con el contexto real de Spring, la alerta llega al reporte. Se comprobó que esta prueba falla contra el commit con el ciclo (`BeanCurrentlyInCreationException`) |
+
+Suite final: **28 pruebas, 0 fallos** (20 de caracterización, 1 de arquitectura y 7 del
+comportamiento nuevo).
+
+**Decisión de diseño 3 — `NotificadorBajoStock` vive en `inventario` y no en `reportes`.**
+`inventario` es el dominio: contiene las reglas de negocio (stock, reorden, tipos de
+producto) y es el paquete de mayor nivel de abstracción. `reportes` es un consumidor que
+presenta información, más cercano a la infraestructura. Siguiendo la regla de la Sección 4.3
+de la guía ("los paquetes de infraestructura dependen de dominio; dominio nunca depende de
+infraestructura"), la abstracción la define quien la necesita: inventario declara "necesito
+avisar que un producto quedó bajo el mínimo" sin saber quién escucha. Si la interfaz
+estuviera en `reportes`, `InventarioService` tendría que importarla desde ahí y el ciclo
+seguiría existiendo (inventario → reportes por la interfaz y reportes → inventario por
+`Producto`). Además, así mañana se puede agregar otro notificador (correo, compras) sin
+tocar inventario.
+
+**Decisión de diseño 4 — notificación por evento: `notificar(Producto, int cantidadReorden)`.**
+En este diseño la alerta nace de un movimiento puntual sobre un solo producto, en el mismo
+instante en que `InventarioService` calcula la cantidad a reordenar. Notificar por evento:
+
+- **Entrega el dato ya calculado.** La política de reorden (mínimo × 3 − stock) queda en el
+  dominio y el reporte no la recalcula ni la duplica.
+- **Es inmediato y no obliga a inventario a acumular nada**: no necesita una lista de
+  pendientes ni decidir cuándo vaciarla.
+- **Deja una interfaz de un solo método.** Es funcional, se implementa con un lambda en las
+  pruebas y cualquier nuevo consumidor la implementa trivialmente.
+
+Una notificación por lote (`notificar(List<Producto>)`) sería preferible si los avisos se
+consumieran de forma consolidada: un resumen diario por correo, un proceso nocturno o una
+carga masiva de inventario que mueve cientos de productos a la vez. En esos casos, mandar un
+aviso por producto generaría ruido o llamadas excesivas a un sistema externo. Hoy cada
+movimiento afecta a un solo producto y el reporte se consulta bajo demanda, así que el lote
+no aporta nada.
+
+## Ajustes respecto al código del enunciado
+- **Spring Boot 3.5.16.** Spring Initializr ya solo ofrece Boot 4, que trae JUnit 6. El
+  prerrequisito pide JUnit 5 incluido en `spring-boot-starter-test`, así que se fijó el
+  último parche de la línea 3.x.
+- **`EtiquetadoProductoTest` con las cuatro ramas.** El enunciado traía solo LIBRO y
+  ELECTRONICO, pero su propio checkpoint exige cubrir las cuatro ramas en ambas clases.
+- **Casos límite adicionales** en `InventarioServiceTest` (ver Parte 1).
+- **`ReporteBajoStockService` sin dependencia de `InventarioService`** tras la inversión,
+  para eliminar el ciclo de beans que impedía arrancar la aplicación.
+- **Conteo de pruebas.** El enunciado anuncia `Tests run: 12` en el Paso 4, pero sus propias
+  pruebas suman 12 de caracterización más la de arquitectura (13). Aquí el total es 28 por
+  los casos agregados y las pruebas del comportamiento nuevo.
+- **Commit en rojo intencional.** El commit
+  `test: agregar prueba de arquitectura que detecta ciclo... (en rojo)` deja
+  `ArquitecturaPaquetesTest` fallando a propósito, como pide el Paso 2, para documentar el
+  diagnóstico antes de resolverlo. Todos los demás commits pasan `./mvnw test` en verde.
+
 ## Ejecutar las pruebas
 ```bash
-./mvnw test
+./mvnw test                                   # Suite completa (28 pruebas)
+./mvnw test -Dtest=ArquitecturaPaquetesTest   # Solo la prueba de arquitectura
+./mvnw spring-boot:run                        # Verifica que el contexto arranca
 ```
+
+## Herramientas utilizadas
+- Java 17, Spring Boot 3.5, JUnit 5, ArchUnit 1.3
+- Apache Maven, lizard (métricas de líneas y complejidad), Git, GitHub
+
+## Conclusiones
+Escribir las pruebas de caracterización antes de tocar el código fue lo que hizo posible
+refactorizar con confianza: además de proteger los casos obvios, obligaron a preservar un
+comportamiento sospechoso (la entrada negativa) que un refactor "intuitivo" habría cambiado
+sin querer. Las técnicas de Fowler se eligieron por lo que pedía cada smell: Extract Method
+redujo `actualizarInventario()` de 44 líneas y complejidad 12 a 8 líneas y complejidad 2, y
+Replace Conditional with Polymorphism dejó en un solo archivo lo que antes había que cambiar
+en tres. En la Parte 2 quedó claro que un code smell no es un bug: el ciclo entre paquetes
+compilaba y pasaba todas las pruebas de negocio, y solo una prueba de arquitectura lo hizo
+visible. También quedó claro que invertir la dependencia entre paquetes no basta si el grafo
+de objetos sigue siendo circular; por eso el reporte pasó a recibir eventos en lugar de
+consultar al inventario, y una prueba de integración con Spring protege ahora ese límite.
