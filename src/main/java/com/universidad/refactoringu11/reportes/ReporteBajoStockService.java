@@ -1,31 +1,42 @@
 package com.universidad.refactoringu11.reportes;
 
-import com.universidad.refactoringu11.inventario.InventarioService;
+import com.universidad.refactoringu11.inventario.NotificadorBajoStock;
 import com.universidad.refactoringu11.inventario.Producto;
 import org.springframework.stereotype.Service;
 
 import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
 
 @Service
-public class ReporteBajoStockService {
+public class ReporteBajoStockService implements NotificadorBajoStock {
 
-    private final InventarioService inventarioService;
+    private final List<AlertaBajoStock> alertas = new CopyOnWriteArrayList<>();
 
-    public ReporteBajoStockService(InventarioService inventarioService) {
-        this.inventarioService = inventarioService;
+    @Override
+    public void notificar(Producto producto, int cantidadReorden) {
+        // Se guarda una copia de los valores del momento: el stock del producto puede
+        // cambiar despues y el reporte debe mostrar el estado que disparo la alerta
+        alertas.add(new AlertaBajoStock(producto.getNombre(), producto.getStock(),
+                producto.getStockMinimo(), cantidadReorden));
     }
 
     public String generarReporte() {
-        // recorre los productos bajo stock minimo expuestos por InventarioService
-        // y arma un reporte de texto plano
-        List<Producto> bajoStock = inventarioService.productosBajoStockMinimo();
         StringBuilder reporte = new StringBuilder("REPORTE DE BAJO STOCK");
-        for (Producto producto : bajoStock) {
+        if (alertas.isEmpty()) {
+            return reporte.append(System.lineSeparator())
+                          .append("Sin alertas registradas").toString();
+        }
+        for (AlertaBajoStock alerta : alertas) {
             reporte.append(System.lineSeparator())
-                   .append("- ").append(producto.getNombre())
-                   .append(": stock ").append(producto.getStock())
-                   .append(" (minimo ").append(producto.getStockMinimo()).append(")");
+                   .append("- ").append(alerta.nombreProducto())
+                   .append(": stock ").append(alerta.stock())
+                   .append(" (minimo ").append(alerta.stockMinimo())
+                   .append("), reordenar ").append(alerta.cantidadReorden());
         }
         return reporte.toString();
+    }
+
+    private record AlertaBajoStock(String nombreProducto, int stock, int stockMinimo,
+                                   int cantidadReorden) {
     }
 }
