@@ -165,6 +165,68 @@ se comparó contra el código original, ejecutando ambas con las mismas entradas
   nombre (incluido un nombre nulo) con resultados idénticos. Con tipo nulo, ambas versiones
   lanzan `NullPointerException`.
 
+# Parte 2 — Diagnóstico y resolución de acoplamiento entre paquetes
+
+## Diagnóstico: ciclo entre `inventario` y `reportes`
+
+Para que `InventarioService` avisara al módulo de reportes al detectar bajo stock, se le
+agregó un colaborador opcional por setter (`setReporteBajoStockService`), invocado en la rama
+de reorden. A su vez, `ReporteBajoStockService` recibe `InventarioService` por constructor
+para recorrer los productos bajo el mínimo (`productosBajoStockMinimo()`). Cada paquete
+depende del otro:
+
+```mermaid
+flowchart LR
+    I["inventario<br/>InventarioService"] -- "setReporteBajoStockService()<br/>generarReporte()" --> R["reportes<br/>ReporteBajoStockService"]
+    R -- "constructor(InventarioService)<br/>productosBajoStockMinimo()" --> I
+```
+
+```
+  inventario  ───── importa ReporteBajoStockService ─────▶  reportes
+      ▲                                                        │
+      └───────────── importa InventarioService, Producto ──────┘
+```
+
+El código compila y las 20 pruebas de caracterización siguen en verde, porque el problema
+es de arquitectura y no de comportamiento. La prueba de arquitectura
+`ArquitecturaPaquetesTest` (ArchUnit, regla `slices().should().beFreeOfCycles()`) sí lo
+detecta y falla:
+
+```
+Architecture Violation [Priority: MEDIUM] - Rule 'slices matching
+'com.universidad.refactoringu11.(*)..' should be free of cycles' was violated (1 times):
+Cycle detected: Slice inventario ->
+  1. Dependencies of Slice inventario
+    - Field <InventarioService.reporteBajoStockService> has type <ReporteBajoStockService>
+    - Method <InventarioService.setReporteBajoStockService(ReporteBajoStockService)> has parameter of type <ReporteBajoStockService>
+    - Method <InventarioService.resultadoDelMovimiento(Producto)> calls method <ReporteBajoStockService.generarReporte()>
+  2. Dependencies of Slice reportes
+    - Constructor <ReporteBajoStockService.<init>(InventarioService)> has parameter of type <InventarioService>
+    - Method <ReporteBajoStockService.generarReporte()> calls method <InventarioService.productosBajoStockMinimo()>
+    - Method <ReporteBajoStockService.generarReporte()> calls method <Producto.getNombre()> (y getStock, getStockMinimo)
+
+Tests run: 1, Failures: 1, Errors: 0, Skipped: 0
+```
+
+**El ciclo de paquetes también es un ciclo de objetos.** Las pruebas de caracterización no lo
+ven porque instancian `InventarioService` con `new`, pero al arrancar la aplicación con
+`./mvnw spring-boot:run` Spring Boot no puede construir los beans:
+
+```
+APPLICATION FAILED TO START
+
+The dependencies of some of the beans in the application context form a cycle:
+┌─────┐
+|  inventarioService
+↑     ↓
+|  reporteBajoStockService
+└─────┘
+```
+
+Que el `@Autowired(required = false)` vuelva opcional al colaborador no evita el problema: en
+cuanto el bean existe, Spring intenta inyectarlo, y para crearlo necesita el
+`InventarioService` que todavía está en construcción.
+
 ## Ejecutar las pruebas
 ```bash
 ./mvnw test
